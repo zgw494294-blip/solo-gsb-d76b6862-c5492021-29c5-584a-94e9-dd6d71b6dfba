@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Single Uvicorn process; concurrency is bounded by the shared
+      # process executor inside it (see README).
+      AUDIO_WORKERS: ${AUDIO_WORKERS:-2}
+      AUDIO_QUEUE: ${AUDIO_QUEUE:-4}
+    restart: unless-stopped
