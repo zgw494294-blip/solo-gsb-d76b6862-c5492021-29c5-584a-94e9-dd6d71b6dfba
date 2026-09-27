@@ -23,8 +23,8 @@ pytest                             # 运行测试
 ## 并发与容量
 
 全部音频 POST 接口共享一个**有界进程执行器**：音频计算在子进程池中执行，
-HTTP 处理协程等待并返回原结果。Compose 运行**单个 Uvicorn 进程**，并发度由
-进程内执行器限制：
+HTTP 处理协程在等待结果期间同时监听 ASGI `http.disconnect` 事件。Compose
+运行**单个 Uvicorn 进程**，并发度由进程内执行器限制：
 
 | 环境变量 | 默认 | 范围 | 说明 |
 |---|---|---|---|
@@ -35,12 +35,26 @@ HTTP 处理协程等待并返回原结果。Compose 运行**单个 Uvicorn 进�
 
 - 运行数 + 排队数满额时，新请求**立即返回 `503`** 并带 `Retry-After: 1`，
   不会继续向进程池堆积任务；
-- 排队中的请求断开连接：从队列移除并释放名额；运行中的请求断开：仅丢弃
-  结果，待计算结束后才释放名额；
+- **客户端断开**（关闭 TCP 连接）在排队或计算期间都会被 HTTP 层通过
+  `http.disconnect` 感知并取消对应等待任务，不会留下占着名额的死等待：
+  - 排队中断开：等待任务**立即退出 FIFO 队列并释放等待位**，后续请求立刻
+    可以入队，不再误收 `503`；
+  - 运行中断开：**只丢弃结果**，工作位要等子进程里的计算真正结束才释放
+    （无法中止已在子进程内运行的计算）；
+  - 断开与完成/异常竞态时，先到者胜：计算先完成则照常走响应路径
+    （对已关闭的 socket 写入是静默无操作），名额在任一路径下都只释放一次；
 - 完成、业务异常（`422`）与取消竞态均只释放一次名额，队列严格 FIFO，
   后续请求不插队；
 - `GET /health` 不经过队列，饱和时仍可响应；
 - 执行器随应用启动创建、关闭时回收。
+
+> 实现要点：路由不直接 `await executor.run(...)`，而是把它放进一个子任务，
+> 与「读取下一个 ASGI 消息」的监听任务 `asyncio.wait(..., FIRST_COMPLETED)`；
+> 请求体在路由执行前已被 FastAPI 读完，监听器只会等到 `http.disconnect`。
+> 子进程执行器侧的状态机（`queued → running → done`，运行中取消经
+> `cancelled` 过渡）保证名额只释放一次。相关测试同时用 `httpx` ASGI 传输
+> （取消请求任务）和**真实 Uvicorn + 真实 TCP socket**（真正关闭连接）
+> 覆盖两阶段断开与容量恢复。
 
 ## API
 
@@ -913,7 +927,8 @@ tests/
   test_onsets.py
   test_convolution_reverb.py
   test_executor.py          # 执行器并发：满队列、两阶段断开、异常后容量恢复
-  test_concurrency_http.py  # HTTP 层并发：503+Retry-After、/health 旁路、生命周期
+  test_concurrency_http.py  # HTTP 层并发：503+Retry-After、/health 旁路、
+                            # ASGI 取消与真实 socket 两阶段断开、容量恢复、生命周期
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖（已锁定版本）
